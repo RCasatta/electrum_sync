@@ -4,12 +4,10 @@ use bitcoin::secp256k1::{All, Secp256k1};
 use bitcoin::util::bip32::{ChildNumber, ExtendedPubKey};
 use bitcoin::{Address, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid};
 use electrum_client::{Client, GetHistoryRes};
-use sled;
-use sled::Tree;
+use sled::{self, Tree};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
-use std::ops::Deref;
-use std::ops::DerefMut;
+use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::time::Instant;
 
@@ -28,6 +26,7 @@ struct Forest {
     headers: Tree,
     scripts: Tree,
     paths: Tree,
+    singles: Tree,
     secp: Secp256k1<All>,
     xpub: ExtendedPubKey,
 }
@@ -36,10 +35,11 @@ impl Forest {
         let db = sled::open(path).unwrap();
         Forest {
             txs: db.open_tree("txs").unwrap(),
+            paths: db.open_tree("paths").unwrap(),
             heights: db.open_tree("heights").unwrap(),
             headers: db.open_tree("headers").unwrap(),
             scripts: db.open_tree("scripts").unwrap(),
-            paths: db.open_tree("paths").unwrap(),
+            singles: db.open_tree("singles").unwrap(),
             secp: Secp256k1::new(),
             xpub,
         }
@@ -126,6 +126,18 @@ impl Forest {
 
     pub fn insert_path(&self, script: &Script, path: &Path) {
         self.paths.insert(script.as_bytes(), path.as_ref()).unwrap();
+    }
+
+    pub fn insert_index(&self, int_or_ext: u32, value: u32) {
+        self.singles
+            .insert([int_or_ext as u8], &value.to_be_bytes())
+            .unwrap();
+    }
+
+    pub fn _get_index(&self, int_or_ext: u32) -> u32 {
+        let ivec = self.singles.get([int_or_ext as u8]).unwrap().unwrap();
+        let bytes: [u8; 4] = ivec.as_ref().try_into().unwrap();
+        u32::from_be_bytes(bytes)
     }
 
     pub fn is_mine(&self, script: &Script) -> bool {
@@ -220,23 +232,30 @@ fn sync(db: &Forest) {
     let mut heights_set = HashSet::new();
     let mut txid_height = HashMap::new();
 
+    let mut last_used = [0u32; 2];
     for i in 0..=1 {
         let mut batch_count = 0;
         loop {
             let batch = db.get_script_batch(i, batch_count);
-            let result: Vec<GetHistoryRes> = client
-                .batch_script_get_history(&batch)
-                .unwrap()
-                .into_iter()
-                .flatten()
-                .collect();
-            println!("{}/batch({}) {:?}", i, batch_count, result.len());
+            let result: Vec<Vec<GetHistoryRes>> = client.batch_script_get_history(&batch).unwrap();
+            let max = result
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(i, _)| i as u32)
+                .max();
+            if let Some(max) = max {
+                last_used[i as usize] = max
+            };
 
-            if result.is_empty() {
+            let flattened: Vec<GetHistoryRes> = result.into_iter().flatten().collect();
+            println!("{}/batch({}) {:?}", i, batch_count, flattened.len());
+
+            if flattened.is_empty() {
                 break;
             }
 
-            for el in result {
+            for el in flattened {
                 if el.height >= 0 {
                     heights_set.insert(el.height as u32);
                     txid_height.insert(el.tx_hash, el.height as u32);
@@ -247,7 +266,13 @@ fn sync(db: &Forest) {
             batch_count += 1;
         }
     }
-    println!("elapsed {}", (Instant::now() - start).as_millis());
+    db.insert_index(0, last_used[0]);
+    db.insert_index(1, last_used[1]);
+    println!(
+        "last_used: {:?} elapsed {}",
+        last_used,
+        (Instant::now() - start).as_millis()
+    );
 
     let mut txs_to_download = Vec::new();
     for tx_id in history_txs_id.iter() {
@@ -366,8 +391,11 @@ fn list_tx(db: &Forest) -> Vec<TransactionMeta> {
         };
         txs.push(tx_meta);
     }
-    txs.sort_by(|a, b| b.time.unwrap_or(std::u32::MAX).cmp(&a.time.unwrap_or(std::u32::MAX))
-    );
+    txs.sort_by(|a, b| {
+        b.time
+            .unwrap_or(std::u32::MAX)
+            .cmp(&a.time.unwrap_or(std::u32::MAX))
+    });
     txs
 }
 
