@@ -9,5 +9,7 @@ edition = "2018"
 [dependencies]
 bitcoin = "0.23.0"
 # electrum-client = "0.1.0-beta.5"
-electrum-client = { path = "../rust-electrum-client" }
+# electrum-client = { path = "../rust-electrum-client" }
+electrum-client = {  git = "https://github.com/RCasatta/rust-electrum-client", rev="a9455cfb4c0c6c6755b53d403f910649fa4293bb" }
+
 sled = "0.31.0"
