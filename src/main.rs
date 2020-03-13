@@ -312,7 +312,7 @@ fn sync(db: &Forest) {
     }
     for (txid_db, _) in db.get_heights().iter() {
         if txid_height.get(txid_db).is_none() {
-            db.remove_height(txid_db); // something in the db is not in live list, removing (probably rbf'ed tx)
+            db.remove_height(txid_db); // something in the db is not in live list (rbf), removing
         }
     }
 
@@ -366,7 +366,8 @@ fn list_tx(db: &Forest) -> Vec<TransactionMeta> {
         };
         txs.push(tx_meta);
     }
-    txs.sort_by(|a, b| b.time.cmp(&a.time));
+    txs.sort_by(|a, b| b.time.unwrap_or(std::u32::MAX).cmp(&a.time.unwrap_or(std::u32::MAX))
+    );
     txs
 }
 
