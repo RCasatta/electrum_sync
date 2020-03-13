@@ -45,19 +45,19 @@ impl Forest {
         }
     }
 
-    pub fn get_heights(&self) -> Vec<(Option<u32>, Txid)> {
+    pub fn get_heights(&self) -> Vec<(Txid, Option<u32>)> {
         let mut heights = vec![];
         for keyvalue in self.heights.iter() {
             let (key, value) = keyvalue.unwrap();
             let txid = Txid::from_slice(&key).unwrap();
             let height = Height::from_slice(&value).1;
             let height = if height == 0 { None } else { Some(height) };
-            heights.push((height, txid));
+            heights.push((txid, height));
         }
         heights
     }
 
-    pub fn get_all_spent_and_txs(&self) -> (HashSet<OutPoint>,Transactions) {
+    pub fn get_all_spent_and_txs(&self) -> (HashSet<OutPoint>, Transactions) {
         let mut txs = Transactions::default();
         let mut spent = HashSet::new();
         for keyvalue in self.txs.iter() {
@@ -96,11 +96,8 @@ impl Forest {
             .unwrap();
     }
 
-    pub fn _get_height(&self, txid: &Txid) -> Option<u32> {
-        self.heights
-            .get(txid)
-            .unwrap()
-            .map(|v| deserialize(&v).unwrap())
+    pub fn remove_height(&self, txid: &Txid) {
+        self.heights.remove(txid).unwrap();
     }
 
     pub fn insert_height(&self, txid: &Txid, height: u32) {
@@ -148,8 +145,7 @@ impl Forest {
                 let second_path = [ChildNumber::from(j)];
                 let second_deriv = first_deriv.derive_pub(&self.secp, &second_path).unwrap();
                 //let address = Address::p2shwpkh(&second_deriv.public_key, Network::Testnet);
-                let address =
-                    Address::p2wpkh(&second_deriv.public_key, Network::Testnet);
+                let address = Address::p2wpkh(&second_deriv.public_key, Network::Testnet);
                 let script = address.script_pubkey();
                 self.insert_script(&path, &script);
                 self.insert_path(&script, &path);
@@ -180,7 +176,9 @@ impl DerefMut for Transactions {
 }
 impl Transactions {
     fn get_previous_output(&self, outpoint: &OutPoint) -> Option<TxOut> {
-        self.0.get(&outpoint.txid).map(|tx| tx.output[outpoint.vout as usize].clone())
+        self.0
+            .get(&outpoint.txid)
+            .map(|tx| tx.output[outpoint.vout as usize].clone())
     }
     fn get_previous_value(&self, outpoint: &OutPoint) -> Option<u64> {
         self.get_previous_output(outpoint).map(|o| o.value)
@@ -219,7 +217,8 @@ fn sync(db: &Forest) {
 
     let mut client = Client::new("tn.not.fyi:55001").unwrap();
     let mut history_txs_id = HashSet::new();
-    let mut heights = HashSet::new();
+    let mut heights_set = HashSet::new();
+    let mut txid_height = HashMap::new();
 
     for i in 0..=1 {
         let mut batch_count = 0;
@@ -239,8 +238,8 @@ fn sync(db: &Forest) {
 
             for el in result {
                 if el.height >= 0 {
-                    heights.insert(el.height as u32);
-                    db.insert_height(&el.tx_hash, el.height as u32);  //TODO handle removal of heights in db! think about rbf
+                    heights_set.insert(el.height as u32);
+                    txid_height.insert(el.tx_hash, el.height as u32);
                 }
                 history_txs_id.insert(el.tx_hash);
             }
@@ -288,7 +287,7 @@ fn sync(db: &Forest) {
     }
 
     let mut heights_to_download = Vec::new();
-    for height in heights {
+    for height in heights_set {
         if db.get_header(height).is_none() {
             heights_to_download.push(height);
         }
@@ -305,6 +304,16 @@ fn sync(db: &Forest) {
             headers_downloaded.len(),
             (Instant::now() - start).as_millis()
         );
+    }
+
+    // sync heights, which are my txs
+    for (txid, height) in txid_height.iter() {
+        db.insert_height(txid, *height); // adding new, but also updating reorged tx
+    }
+    for (txid_db, _) in db.get_heights().iter() {
+        if txid_height.get(txid_db).is_none() {
+            db.remove_height(txid_db); // something in the db is not in live list, removing (probably rbf'ed tx)
+        }
     }
 
     println!("elapsed {}", (Instant::now() - start).as_millis());
@@ -324,7 +333,7 @@ fn list_tx(db: &Forest) -> Vec<TransactionMeta> {
     let heights = db.get_heights();
     let mut txs = vec![];
 
-    for (height, tx_id) in heights {
+    for (tx_id, height) in heights {
         let tx = all_txs.get(&tx_id).unwrap();
         let header = height.map(|h| db.get_header(h).unwrap());
         let total_output: u64 = tx.output.iter().map(|o| o.value).sum();
@@ -357,7 +366,7 @@ fn list_tx(db: &Forest) -> Vec<TransactionMeta> {
         };
         txs.push(tx_meta);
     }
-    txs.sort_by(|a,b| b.time.cmp(&a.time));
+    txs.sort_by(|a, b| b.time.cmp(&a.time));
     txs
 }
 
@@ -365,17 +374,21 @@ fn utxo(db: &Forest) -> Vec<(OutPoint, TxOut)> {
     let (spent, all_txs) = db.get_all_spent_and_txs();
     let heights = db.get_heights();
     let mut utxos = vec![];
-    for (_, tx_id) in heights {
+    for (tx_id, _) in heights {
         let tx = all_txs.get(&tx_id).unwrap();
 
-        let tx_utxos: Vec<(OutPoint, TxOut)>  = tx.output.clone().into_iter().enumerate()
-            .map(|(vout, output)| (OutPoint::new(tx.txid(), vout as u32), output) )
-            .filter(|(_,output)| db.is_mine(&output.script_pubkey))
-            .filter(|(outpoint,_)| !spent.contains(&outpoint) )
+        let tx_utxos: Vec<(OutPoint, TxOut)> = tx
+            .output
+            .clone()
+            .into_iter()
+            .enumerate()
+            .map(|(vout, output)| (OutPoint::new(tx.txid(), vout as u32), output))
+            .filter(|(_, output)| db.is_mine(&output.script_pubkey))
+            .filter(|(outpoint, _)| !spent.contains(&outpoint))
             .collect();
         utxos.extend(tx_utxos);
     }
-    utxos.sort_by(|a,b| b.1.value.cmp(&a.1.value));
+    utxos.sort_by(|a, b| b.1.value.cmp(&a.1.value));
     utxos
 }
 
