@@ -1,21 +1,78 @@
 use bitcoin::util::bip32::ExtendedPubKey;
-use bitcoin::{OutPoint, Transaction, TxOut};
+use bitcoin::{OutPoint, Script, Transaction, TxOut, Txid};
 use db::*;
+use electrum_client::client::{ElectrumSslStream, ToSocketAddrsDomain};
 use electrum_client::{Client, GetHistoryRes};
 use error::*;
+use log::{info, Level, LevelFilter, Metadata, Record};
 use std::collections::{HashMap, HashSet};
+use std::io::{ErrorKind, Read, Write};
+use std::net::SocketAddr;
 use std::str::FromStr;
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 mod db;
 mod error;
 
+pub struct RetryClient<'a, S>
+where
+    S: Read + Write,
+{
+    socket_addr: &'a str,
+    validate_domain: bool,
+    client: Client<S>,
+    attempts: u8,
+}
+
+impl<'a> RetryClient<'a, ElectrumSslStream> {
+    pub fn new_ssl(socket_addr: &'a str, validate_domain: bool) -> Result<Self, Error> {
+        let client = Client::new_ssl(socket_addr, validate_domain)?;
+        let attempts = 0u8;
+        Ok(RetryClient {
+            client,
+            attempts,
+            socket_addr,
+            validate_domain,
+        })
+    }
+    pub fn batch_script_get_history<'s, I>(
+        &mut self,
+        scripts: I,
+    ) -> Result<Vec<Vec<GetHistoryRes>>, Error>
+    where
+        I: IntoIterator<Item = &'s Script> + Clone,
+    {
+        loop {
+            match self.client.batch_script_get_history(scripts.clone()) {
+                Ok(result) => {
+                    self.attempts = 0;
+                    return Ok(result);
+                }
+                Err(e) => {
+                    println!("Error, attempts:{}", self.attempts);
+                    if self.attempts > 3 {
+                        println!("attempts > 3, giving up");
+                        return err("giving up");
+                    } else {
+                        println!("Creating new client");
+                        self.attempts += 1;
+                        self.client = Client::new_ssl(self.socket_addr, self.validate_domain)?;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), Error> {
+    init_logger(3);
     let xpub = "tpubD6NzVbkrYhZ4YRJLsDvYBaXK6EFi9MSV34h8BAvHPzW8RtUpJpBFiL23hRnvrRUcb6Fz9eKiVG8EzZudGXYfdo5tiP8BuhrsBmFAsREPZG4";
+    //let xpub = "tpubD6NzVbkrYhZ4Xz3UW47QhZBejbwrU4khTztuBoN8tpANN7Mu4St3cWgSUkrZc8v9FbFZaLwCDPHo8gKW3R1GqNTADCSrHpGkAVMyEKUbz4q";
     let xpub = ExtendedPubKey::from_str(xpub)?;
     let db = Forest::new("/tmp/db", xpub)?;
 
-    sync(&db)?;
+    let elapsed = sync(&db)?;
     let txs = list_tx(&db)?;
     for tx_meta in txs {
         println!(
@@ -36,13 +93,19 @@ fn main() -> Result<(), Error> {
     }
     println!("balance {}", balance);
 
+    println!("sync elapsed {}", elapsed);
+
     Ok(())
 }
 
-fn sync(db: &Forest) -> Result<(), Error> {
+fn sync(db: &Forest) -> Result<u128, Error> {
     let start = Instant::now();
 
-    let mut client = Client::new("tn.not.fyi:55001")?;
+    //let mut client = Client::new_proxy("ozahtqwp25chjdjd.onion:50001", "127.0.0.1:9050").unwrap();
+    //let mut client = Client::new_proxy("explorerzydxu5ecjrkwceayqybizmpjjznk5izmitf2modhcusuqlid.onion:143", "127.0.0.1:9050")?;
+    let mut client = RetryClient::new_ssl("blockstream.info:993", true)?;
+    thread::sleep(Duration::from_secs(300)); // Error: Error("IOError(Kind(UnexpectedEof))")
+
     let mut history_txs_id = HashSet::new();
     let mut heights_set = HashSet::new();
     let mut txid_height = HashMap::new();
@@ -83,80 +146,53 @@ fn sync(db: &Forest) -> Result<(), Error> {
     }
     db.insert_index(0, last_used[0])?;
     db.insert_index(1, last_used[1])?;
-    println!(
-        "last_used: {:?} elapsed {}",
-        last_used,
-        (Instant::now() - start).as_millis()
-    );
-
-    let mut txs_to_download = Vec::new();
-    for tx_id in history_txs_id.iter() {
-        if db.get_tx(tx_id)?.is_none() {
-            txs_to_download.push(tx_id);
-        }
-    }
+    println!("last_used: {:?}", last_used,);
+    /*
+    let mut txs_in_db = db.get_all_txid()?;
+    let txs_to_download: Vec<&Txid> = history_txs_id.difference(&txs_in_db).collect();
     if !txs_to_download.is_empty() {
         let txs_downloaded = client.batch_transaction_get(txs_to_download)?;
-        println!(
-            "txs_downloaded {:?} {}",
-            txs_downloaded.len(),
-            (Instant::now() - start).as_millis()
-        );
-        let mut previous_txs_set = HashSet::new();
+        println!("txs_downloaded {:?}", txs_downloaded.len());
+        let mut previous_txs_to_download = HashSet::new();
         for tx in txs_downloaded.iter() {
             db.insert_tx(&tx.txid(), &tx)?;
+            txs_in_db.insert(tx.txid());
             for input in tx.input.iter() {
-                previous_txs_set.insert(input.previous_output.txid);
+                previous_txs_to_download.insert(input.previous_output.txid);
             }
         }
-        let mut previous_txs_vec = vec![];
-        for tx_id in previous_txs_set {
-            if db.get_tx(&tx_id)?.is_none() {
-                previous_txs_vec.push(tx_id);
+        let txs_to_download: Vec<&Txid> = previous_txs_to_download.difference(&txs_in_db).collect();
+        if !txs_to_download.is_empty() {
+            let txs_downloaded = client.batch_transaction_get(txs_to_download)?;
+            println!("previous txs_downloaded {:?}", txs_downloaded.len());
+            for tx in txs_downloaded.iter() {
+                db.insert_tx(&tx.txid(), tx)?;
             }
-        }
-        let txs_downloaded = client.batch_transaction_get(&previous_txs_vec)?;
-        println!(
-            "previous txs_downloaded {:?} {}",
-            txs_downloaded.len(),
-            (Instant::now() - start).as_millis()
-        );
-        for tx in txs_downloaded.iter() {
-            db.insert_tx(&tx.txid(), tx)?;
         }
     }
 
-    let mut heights_to_download = Vec::new();
-    for height in heights_set {
-        if db.get_header(height)?.is_none() {
-            heights_to_download.push(height);
-        }
-    }
+    let heights_in_db = db.get_only_heights()?;
+    let heights_to_download: Vec<u32> = heights_set.difference(&heights_in_db).cloned().collect();
     if !heights_to_download.is_empty() {
         let headers_downloaded = client.batch_block_header(heights_to_download.clone())?;
         for (header, height) in headers_downloaded.iter().zip(heights_to_download.iter()) {
             db.insert_header(*height, header)?;
         }
-        println!(
-            "headers_downloaded {:?} {}",
-            headers_downloaded.len(),
-            (Instant::now() - start).as_millis()
-        );
+        println!("headers_downloaded {:?}", headers_downloaded.len());
     }
 
     // sync heights, which are my txs
     for (txid, height) in txid_height.iter() {
         db.insert_height(txid, *height)?; // adding new, but also updating reorged tx
     }
-    for (txid_db, _) in db.get_heights()?.iter() {
+    for txid_db in db.get_only_txids()?.iter() {
         if txid_height.get(txid_db).is_none() {
             db.remove_height(txid_db)?; // something in the db is not in live list (rbf), removing
         }
     }
+    */
 
-    println!("elapsed {}", (Instant::now() - start).as_millis());
-
-    Ok(())
+    Ok((Instant::now() - start).as_millis())
 }
 
 struct TransactionMeta {
@@ -170,10 +206,9 @@ struct TransactionMeta {
 
 fn list_tx(db: &Forest) -> Result<Vec<TransactionMeta>, Error> {
     let (_, all_txs) = db.get_all_spent_and_txs()?;
-    let heights = db.get_heights()?;
     let mut txs = vec![];
 
-    for (tx_id, height) in heights {
+    for (tx_id, height) in db.get_my()? {
         let tx = all_txs.get(&tx_id).ok_or_else(fn_err("no tx"))?;
         let header = height
             .map(|h| db.get_header(h)?.ok_or_else(fn_err("no header")))
@@ -218,9 +253,8 @@ fn list_tx(db: &Forest) -> Result<Vec<TransactionMeta>, Error> {
 
 fn utxo(db: &Forest) -> Result<Vec<(OutPoint, TxOut)>, Error> {
     let (spent, all_txs) = db.get_all_spent_and_txs()?;
-    let heights = db.get_heights()?;
     let mut utxos = vec![];
-    for (tx_id, _) in heights {
+    for tx_id in db.get_only_txids()? {
         let tx = all_txs.get(&tx_id).ok_or_else(fn_err("no tx"))?;
         let tx_utxos: Vec<(OutPoint, TxOut)> = tx
             .output
@@ -235,4 +269,38 @@ fn utxo(db: &Forest) -> Result<Vec<(OutPoint, TxOut)>, Error> {
     }
     utxos.sort_by(|a, b| b.1.value.cmp(&a.1.value));
     Ok(utxos)
+}
+
+static LOGGER: SimpleLogger = SimpleLogger;
+
+pub struct SimpleLogger;
+
+impl log::Log for SimpleLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &Record) {
+        if self.enabled(record.metadata()) {
+            if record.level() <= Level::Warn {
+                println!("{} - {}", record.level(), record.args());
+            } else {
+                println!("{}", record.args());
+            }
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+pub fn init_logger(verbose: u8) {
+    //TODO write log message to file
+    let level = match verbose {
+        0 => LevelFilter::Off,
+        1 => LevelFilter::Info,
+        _ => LevelFilter::Debug,
+    };
+    log::set_logger(&LOGGER)
+        .map(|()| log::set_max_level(level))
+        .expect("cannot initialize logging");
 }

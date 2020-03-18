@@ -3,7 +3,7 @@ use std::string::ToString;
 #[derive(Debug)]
 pub struct Error(pub String);
 
-pub fn _err<R>(str: &str) -> Result<R, Error> {
+pub fn err<R>(str: &str) -> Result<R, Error> {
     Err(Error(str.into()))
 }
 
@@ -22,8 +22,8 @@ impl From<String> for Error {
 }
 
 impl From<electrum_client::types::Error> for Error {
-    fn from(_: electrum_client::types::Error) -> Error {
-        Error("electrum_client::types::Error".to_string())
+    fn from(e: electrum_client::types::Error) -> Error {
+        Error(format!("{:?}", e))
     }
 }
 

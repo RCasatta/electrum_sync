@@ -43,7 +43,7 @@ impl Forest {
         })
     }
 
-    pub fn get_heights(&self) -> Result<Vec<(Txid, Option<u32>)>, Error> {
+    pub fn get_my(&self) -> Result<Vec<(Txid, Option<u32>)>, Error> {
         let mut heights = vec![];
         for keyvalue in self.heights.iter() {
             let (key, value) = keyvalue?;
@@ -53,6 +53,14 @@ impl Forest {
             heights.push((txid, height));
         }
         Ok(heights)
+    }
+
+    pub fn get_only_heights(&self) -> Result<HashSet<u32>, Error> {
+        Ok(self.get_my()?.into_iter().filter_map(|t| t.1).collect())
+    }
+
+    pub fn get_only_txids(&self) -> Result<HashSet<Txid>, Error> {
+        Ok(self.get_my()?.into_iter().map(|t| t.0).collect())
     }
 
     pub fn get_all_spent_and_txs(&self) -> Result<(HashSet<OutPoint>, Transactions), Error> {
@@ -70,7 +78,45 @@ impl Forest {
         Ok((spent, txs))
     }
 
-    pub fn get_tx(&self, txid: &Txid) -> Result<Option<Transaction>, Error> {
+    pub fn get_all_txid(&self) -> Result<HashSet<Txid>, Error> {
+        let mut set = HashSet::new();
+        for keyvalue in self.txs.iter() {
+            let (key, _) = keyvalue?;
+            let txid = Txid::from_slice(&key)?;
+            set.insert(txid);
+        }
+        Ok(set)
+    }
+
+    pub fn get_script_batch(&self, int_or_ext: u32, batch: u32) -> Result<Vec<Script>, Error> {
+        let mut result = vec![];
+        let first_path = [ChildNumber::from(int_or_ext)];
+        let first_deriv = self.xpub.derive_pub(&self.secp, &first_path)?;
+
+        let start = batch * BATCH_SIZE;
+        let end = start + BATCH_SIZE;
+        for j in start..end {
+            let path = Path::new(int_or_ext, j);
+            let opt_script = self.get_script(&path)?;
+            let script = match opt_script {
+                Some(script) => script,
+                None => {
+                    let second_path = [ChildNumber::from(j)];
+                    let second_deriv = first_deriv.derive_pub(&self.secp, &second_path)?;
+                    //let address = Address::p2shwpkh(&second_deriv.public_key, Network::Testnet);
+                    let address = Address::p2wpkh(&second_deriv.public_key, Network::Testnet);
+                    let script = address.script_pubkey();
+                    self.insert_script(&path, &script)?;
+                    self.insert_path(&script, &path)?;
+                    script
+                }
+            };
+            result.push(script);
+        }
+        Ok(result)
+    }
+
+    pub fn _get_tx(&self, txid: &Txid) -> Result<Option<Transaction>, Error> {
         self.txs
             .get(txid)?
             .map(|v| Ok(deserialize(&v)?))
@@ -152,34 +198,6 @@ impl Forest {
             Ok(p) => p.is_some(),
             Err(_) => false,
         }
-    }
-
-    pub fn get_script_batch(&self, int_or_ext: u32, batch: u32) -> Result<Vec<Script>, Error> {
-        let mut result = vec![];
-        let first_path = [ChildNumber::from(int_or_ext)];
-        let first_deriv = self.xpub.derive_pub(&self.secp, &first_path)?;
-
-        let start = batch * BATCH_SIZE;
-        let end = start + BATCH_SIZE;
-        for j in start..end {
-            let path = Path::new(int_or_ext, j);
-            let opt_script = self.get_script(&path)?;
-            let script = match opt_script {
-                Some(script) => script,
-                None => {
-                    let second_path = [ChildNumber::from(j)];
-                    let second_deriv = first_deriv.derive_pub(&self.secp, &second_path)?;
-                    //let address = Address::p2shwpkh(&second_deriv.public_key, Network::Testnet);
-                    let address = Address::p2wpkh(&second_deriv.public_key, Network::Testnet);
-                    let script = address.script_pubkey();
-                    self.insert_script(&path, &script)?;
-                    self.insert_path(&script, &path)?;
-                    script
-                }
-            };
-            result.push(script);
-        }
-        Ok(result)
     }
 }
 
